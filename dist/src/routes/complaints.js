@@ -944,7 +944,12 @@ router.get("/", auth_1.authenticate, (0, auth_1.requireAnyPermission)("complaint
         const p = Math.max(1, parseInt(page));
         const l = Math.min(1000, parseInt(limit));
         const total = await c.complaints.countDocuments(scopedFilter);
-        const data = await c.complaints.find(scopedFilter).skip((p - 1) * l).limit(l).toArray();
+        const data = await c.complaints
+            .find(scopedFilter)
+            .sort({ createdAt: -1, dateOfComplaint: -1 })
+            .skip((p - 1) * l)
+            .limit(l)
+            .toArray();
         return (0, http_1.ok)(res, { data, total, page: p, limit: l });
     }
     catch (err) {
