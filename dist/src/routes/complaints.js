@@ -917,7 +917,7 @@ async function canAccessComplaint(user, complaint) {
 router.get("/", auth_1.authenticate, (0, auth_1.requireAnyPermission)("complaints:consumer", "complaints:supplier", "dispatch:manage"), async (req, res) => {
     try {
         const c = await (0, collections_1.getCollections)();
-        const { type, status, page = "1", limit = "20", view } = req.query;
+        const { type, status, page = "1", limit = "20", view, search } = req.query;
         const user = req.user;
         if (type && !requireComplaintTypeAccess(user, type)) {
             return (0, http_1.fail)(res, "Access denied: insufficient permissions", 403);
@@ -941,8 +941,34 @@ router.get("/", auth_1.authenticate, (0, auth_1.requireAnyPermission)("complaint
         if (!scopedFilter) {
             return (0, http_1.fail)(res, "Access denied: insufficient permissions", 403);
         }
+        if (search && search.trim()) {
+            const q = search.trim();
+            const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const searchRegex = new RegExp(escaped, "i");
+            const normalizedQuery = q.replace(/[\s-]+/g, "");
+            const normalizedRegex = normalizedQuery ? new RegExp(normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+            const orClauses = [
+                { ticketNumber: searchRegex },
+                { id: searchRegex },
+                { productSerialNo: searchRegex },
+                { customerName: searchRegex },
+                { customerPhone: searchRegex },
+                { customerPhones: searchRegex },
+                { dealerName: searchRegex },
+                { region: searchRegex },
+                { state: searchRegex },
+                { district: searchRegex },
+                { productModel: searchRegex },
+                { assignedEngineerName: searchRegex },
+                { issueDescription: searchRegex },
+            ];
+            if (normalizedRegex) {
+                orClauses.push({ ticketNumber: normalizedRegex });
+            }
+            scopedFilter = { $and: [scopedFilter, { $or: orClauses }] };
+        }
         const p = Math.max(1, parseInt(page));
-        const l = Math.min(1000, parseInt(limit));
+        const l = Math.min(10000, parseInt(limit));
         const total = await c.complaints.countDocuments(scopedFilter);
         const data = await c.complaints
             .find(scopedFilter)

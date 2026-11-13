@@ -1050,7 +1050,7 @@ async function canAccessComplaint(user: AuthUser, complaint: Complaint): Promise
 router.get("/", authenticate, requireAnyPermission("complaints:consumer", "complaints:supplier", "dispatch:manage"), async (req: Request, res: Response) => {
   try {
     const c = await getCollections();
-    const { type, status, page = "1", limit = "20", view } = req.query as Record<string, string>;
+    const { type, status, page = "1", limit = "20", view, search } = req.query as Record<string, string>;
     const user = (req as any).user as AuthUser;
     if (type && !requireComplaintTypeAccess(user, type)) {
       return fail(res, "Access denied: insufficient permissions", 403);
@@ -1072,8 +1072,35 @@ router.get("/", authenticate, requireAnyPermission("complaints:consumer", "compl
       return fail(res, "Access denied: insufficient permissions", 403);
     }
 
+    if (search && search.trim()) {
+      const q = search.trim();
+      const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const searchRegex = new RegExp(escaped, "i");
+      const normalizedQuery = q.replace(/[\s-]+/g, "");
+      const normalizedRegex = normalizedQuery ? new RegExp(normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+      const orClauses: Record<string, unknown>[] = [
+        { ticketNumber: searchRegex },
+        { id: searchRegex },
+        { productSerialNo: searchRegex },
+        { customerName: searchRegex },
+        { customerPhone: searchRegex },
+        { customerPhones: searchRegex },
+        { dealerName: searchRegex },
+        { region: searchRegex },
+        { state: searchRegex },
+        { district: searchRegex },
+        { productModel: searchRegex },
+        { assignedEngineerName: searchRegex },
+        { issueDescription: searchRegex },
+      ];
+      if (normalizedRegex) {
+        orClauses.push({ ticketNumber: normalizedRegex });
+      }
+      scopedFilter = { $and: [scopedFilter, { $or: orClauses }] };
+    }
+
     const p = Math.max(1, parseInt(page));
-    const l = Math.min(1000, parseInt(limit));
+    const l = Math.min(10000, parseInt(limit));
     const total = await c.complaints.countDocuments(scopedFilter);
     const data = await c.complaints
       .find(scopedFilter)
