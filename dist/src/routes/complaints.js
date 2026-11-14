@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const multer_1 = __importDefault(require("multer"));
+const xlsx_1 = __importDefault(require("xlsx"));
 const collections_1 = require("../db/collections");
 const auth_1 = require("../middleware/auth");
 const cloudinary_1 = require("../utils/cloudinary");
@@ -1005,6 +1006,245 @@ router.get("/stats", auth_1.authenticate, (0, auth_1.requireAnyPermission)("comp
     ];
     const stats = await Promise.all(statuses.map(async (s) => ({ status: s, count: await c.complaints.countDocuments({ status: s }) })));
     return (0, http_1.ok)(res, stats);
+});
+/** GET /api/complaints/export — export complaints to Excel (.xlsx) */
+router.get("/export", auth_1.authenticate, (0, auth_1.requireAnyPermission)("complaints:consumer", "complaints:supplier", "dispatch:manage"), async (req, res) => {
+    try {
+        const c = await (0, collections_1.getCollections)();
+        const { type = "Consumer", status, preset, fromDate, toDate, state, engineer, search, view, } = req.query;
+        const user = req.user;
+        if (type && !requireComplaintTypeAccess(user, type)) {
+            return (0, http_1.fail)(res, "Access denied: insufficient permissions", 403);
+        }
+        const filter = {};
+        if (type)
+            filter.type = type;
+        let scopedFilter;
+        if (view === "onsite-tracking") {
+            const scope = onsiteTrackingScope(user);
+            scopedFilter = scope ? { $and: [filter, scope] } : null;
+        }
+        else {
+            scopedFilter = await applyComplaintRoleScope(filter, user);
+        }
+        if (!scopedFilter) {
+            return (0, http_1.fail)(res, "Access denied: insufficient permissions", 403);
+        }
+        // Status filter
+        if (status && status !== "all") {
+            const s = status.trim().toLowerCase();
+            if (s === "closed") {
+                scopedFilter = { $and: [scopedFilter, { status: { $in: [...complaintRules_1.CLOSED_COMPLAINT_STATUSES] } }] };
+            }
+            else if (s === "active" || s === "open") {
+                scopedFilter = { $and: [scopedFilter, { status: { $nin: [...complaintRules_1.CLOSED_COMPLAINT_STATUSES] } }] };
+            }
+            else if (s === "hold") {
+                scopedFilter = { $and: [scopedFilter, { status: complaintRules_1.HOLD_TICKET_STATUS }] };
+            }
+            else if (s === "escalated") {
+                scopedFilter = { $and: [scopedFilter, { status: { $regex: /^escalated/i } }] };
+            }
+            else {
+                scopedFilter = { $and: [scopedFilter, { status }] };
+            }
+        }
+        // Date range filter
+        let effectiveFrom = fromDate ? String(fromDate).trim() : "";
+        let effectiveTo = toDate ? String(toDate).trim() : "";
+        const now = new Date();
+        if (preset === "today") {
+            const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+            const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+            effectiveFrom = todayStart.toISOString();
+            effectiveTo = todayEnd.toISOString();
+        }
+        else if (preset === "week") {
+            const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            weekAgo.setHours(0, 0, 0, 0);
+            effectiveFrom = weekAgo.toISOString();
+            effectiveTo = now.toISOString();
+        }
+        else if (preset === "this_month") {
+            const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+            effectiveFrom = monthStart.toISOString();
+            effectiveTo = now.toISOString();
+        }
+        else if (preset === "last_month") {
+            const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+            const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+            effectiveFrom = lastMonthStart.toISOString();
+            effectiveTo = lastMonthEnd.toISOString();
+        }
+        if (effectiveFrom || effectiveTo) {
+            const dateConds = [];
+            if (effectiveFrom) {
+                const dt = new Date(effectiveFrom.includes("T") ? effectiveFrom : `${effectiveFrom}T00:00:00.000Z`);
+                dateConds.push({
+                    $or: [
+                        { createdAt: { $gte: dt } },
+                        { createdAt: { $gte: effectiveFrom } },
+                        { dateOfComplaint: { $gte: dt } },
+                        { dateOfComplaint: { $gte: effectiveFrom } },
+                    ],
+                });
+            }
+            if (effectiveTo) {
+                const dt = new Date(effectiveTo.includes("T") ? effectiveTo : `${effectiveTo}T23:59:59.999Z`);
+                dateConds.push({
+                    $or: [
+                        { createdAt: { $lte: dt } },
+                        { createdAt: { $lte: effectiveTo } },
+                        { dateOfComplaint: { $lte: dt } },
+                        { dateOfComplaint: { $lte: effectiveTo } },
+                    ],
+                });
+            }
+            if (dateConds.length) {
+                scopedFilter = { $and: [scopedFilter, ...dateConds] };
+            }
+        }
+        // State filter
+        if (state && String(state).trim() && String(state).toLowerCase() !== "all") {
+            const stateRegex = new RegExp(`^${String(state).trim()}$`, "i");
+            scopedFilter = { $and: [scopedFilter, { state: stateRegex }] };
+        }
+        // Engineer filter
+        if (engineer && String(engineer).trim() && String(engineer).toLowerCase() !== "all") {
+            const engRegex = new RegExp(String(engineer).trim(), "i");
+            scopedFilter = { $and: [scopedFilter, { assignedEngineerName: engRegex }] };
+        }
+        // Search query
+        if (search && search.trim()) {
+            const q = search.trim();
+            const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const searchRegex = new RegExp(escaped, "i");
+            const normalizedQuery = q.replace(/[\s-]+/g, "");
+            const normalizedRegex = normalizedQuery ? new RegExp(normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+            const orClauses = [
+                { ticketNumber: searchRegex },
+                { id: searchRegex },
+                { productSerialNo: searchRegex },
+                { customerName: searchRegex },
+                { customerPhone: searchRegex },
+                { dealerName: searchRegex },
+                { state: searchRegex },
+                { district: searchRegex },
+                { productModel: searchRegex },
+                { assignedEngineerName: searchRegex },
+                { issueDescription: searchRegex },
+            ];
+            if (normalizedRegex) {
+                orClauses.push({ ticketNumber: normalizedRegex });
+            }
+            scopedFilter = { $and: [scopedFilter, { $or: orClauses }] };
+        }
+        const complaints = await c.complaints
+            .find(scopedFilter)
+            .sort({ createdAt: -1, dateOfComplaint: -1 })
+            .limit(50000)
+            .toArray();
+        const formatDate = (val) => {
+            if (!val)
+                return "-";
+            const d = new Date(val);
+            if (isNaN(d.getTime()))
+                return String(val);
+            return d.toISOString().replace("T", " ").slice(0, 19);
+        };
+        const formatDateOnly = (val) => {
+            if (!val)
+                return "-";
+            const d = new Date(val);
+            if (isNaN(d.getTime()))
+                return String(val);
+            return d.toISOString().slice(0, 10);
+        };
+        const rows = complaints.map((item, index) => {
+            const isClosed = complaintRules_1.CLOSED_COMPLAINT_STATUSES.includes(item.status);
+            let slaStatus = "-";
+            if (isClosed) {
+                slaStatus = "Completed";
+            }
+            else if (item.slaPaused || item.status === complaintRules_1.HOLD_TICKET_STATUS) {
+                slaStatus = "Paused (On Hold)";
+            }
+            else if (item.slaDueAt) {
+                const due = new Date(item.slaDueAt).getTime();
+                slaStatus = Date.now() > due ? "Breached (Overdue)" : "Within SLA";
+            }
+            const phone = item.customerPhone || (Array.isArray(item.customerPhones) ? item.customerPhones.join(", ") : "-");
+            const serialNo = item.replacementRequestSerialNo || item.replacementSerialNo || item.productSerialNo || "-";
+            return {
+                "S.No": index + 1,
+                "Ticket ID": item.ticketNumber || item.id || "-",
+                "Complaint Date": formatDateOnly(item.dateOfComplaint || item.createdAt),
+                "Registered At": formatDate(item.createdAt || item.dateOfComplaint),
+                "Status": item.status || "-",
+                "Customer Name": item.customerName || "-",
+                "Customer Phone": phone,
+                "Customer Email": item.customerEmail || "-",
+                "Product Model": item.productModel || "-",
+                "Serial Number": serialNo,
+                "State": item.state || "-",
+                "District": item.district || "-",
+                "Site Location": item.siteLocation || "-",
+                "Dealer Name": item.dealerName || "-",
+                "Assigned Engineer": item.assignedEngineerName || "-",
+                "Queue / Level": item.escalationLevel || "-",
+                "Priority": item.priority || "Normal",
+                "Ticket Source": item.ticketSource || "Direct",
+                "SLA Status": slaStatus,
+                "SLA Due Date": formatDate(item.slaDueAt),
+                "Issue Description": item.issueDescription || "-",
+                "Hold Reason": item.holdReason || "-",
+                "Closed At": isClosed ? formatDate(item.closedAt || item.updatedAt) : "-",
+                "Closed By": isClosed ? (item.closedByName || "-") : "-",
+                "Resolution Notes": item.finalResolution || item.closeRemark || item.closureReport || item.trackingNotes || "-",
+            };
+        });
+        const wb = xlsx_1.default.utils.book_new();
+        const ws = xlsx_1.default.utils.json_to_sheet(rows.length ? rows : [{ "Notice": "No complaints found matching criteria" }]);
+        ws["!cols"] = [
+            { wch: 6 },
+            { wch: 18 },
+            { wch: 15 },
+            { wch: 20 },
+            { wch: 22 },
+            { wch: 22 },
+            { wch: 16 },
+            { wch: 24 },
+            { wch: 20 },
+            { wch: 20 },
+            { wch: 16 },
+            { wch: 16 },
+            { wch: 24 },
+            { wch: 20 },
+            { wch: 20 },
+            { wch: 14 },
+            { wch: 12 },
+            { wch: 14 },
+            { wch: 18 },
+            { wch: 20 },
+            { wch: 45 },
+            { wch: 25 },
+            { wch: 20 },
+            { wch: 20 },
+            { wch: 35 },
+        ];
+        xlsx_1.default.utils.book_append_sheet(wb, ws, "Complaints");
+        const buffer = xlsx_1.default.write(wb, { type: "buffer", bookType: "xlsx" });
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const filename = `Aurawatt_Complaints_${todayStr}.xlsx`;
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        return res.send(buffer);
+    }
+    catch (err) {
+        console.error("Failed to export complaints:", err);
+        return (0, http_1.fail)(res, err instanceof Error ? err.message : "Failed to export complaints", 500);
+    }
 });
 /** GET /api/complaints/service-engineers — active L1/L2/L3 engineer accounts */
 router.get("/service-engineers", auth_1.authenticate, (0, auth_1.requireAnyPermission)("complaints:consumer", "complaints:supplier"), async (_req, res) => {
